@@ -27,65 +27,13 @@ function validatePlayerName(name) {
   return /^[a-zA-Z0-9_]{2,16}$/.test(name);
 }
 
-function validateWordsScore(score) {
-  return typeof score === 'number' && score >= 0 && score <= 200;
-}
-
 function validateRoundsSurvived(rounds) {
   return typeof rounds === 'number' && rounds >= 0 && rounds <= 200;
 }
 
-function validateRoundSeconds(seconds) {
-  return typeof seconds === 'number' && seconds >= 5 && seconds <= 60;
+function validateTime(seconds) {
+  return typeof seconds === 'number' && seconds >= 0 && seconds <= 3600;
 }
-
-// POST /api/leaderboard/words - Submit words score
-router.post('/words', (req, res) => {
-  const ip = req.ip || req.connection.remoteAddress;
-  
-  if (!checkRateLimit(ip)) {
-    return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
-  }
-
-  const { playerName, wordsScore, roundNumber, bannedCount, roundSeconds } = req.body;
-
-  if (!validatePlayerName(playerName)) {
-    return res.status(400).json({ error: 'Invalid player name. Must be 2-16 alphanumeric characters or underscores.' });
-  }
-
-  if (!validateWordsScore(wordsScore)) {
-    return res.status(400).json({ error: 'Invalid words score. Must be 0-200.' });
-  }
-
-  if (typeof roundNumber !== 'number' || roundNumber < 1 || roundNumber > 200) {
-    return res.status(400).json({ error: 'Invalid round number.' });
-  }
-
-  if (typeof bannedCount !== 'number' || bannedCount < 1 || bannedCount > 25) {
-    return res.status(400).json({ error: 'Invalid banned count.' });
-  }
-
-  if (!validateRoundSeconds(roundSeconds)) {
-    return res.status(400).json({ error: 'Invalid round seconds. Must be 5-60.' });
-  }
-
-  try {
-    const stmt = db.prepare(`
-      INSERT INTO leaderboard_words (player_name, words_score, round_number, banned_count, round_seconds)
-      VALUES (?, ?, ?, ?, ?)
-    `);
-    
-    const result = stmt.run(playerName, wordsScore, roundNumber, bannedCount, roundSeconds || 25);
-    
-    res.status(201).json({ 
-      id: result.lastInsertRowid, 
-      success: true 
-    });
-  } catch (err) {
-    console.error('Database error:', err);
-    res.status(500).json({ error: 'Failed to save score.' });
-  }
-});
 
 // POST /api/leaderboard/rounds - Submit rounds score
 router.post('/rounds', (req, res) => {
@@ -95,7 +43,7 @@ router.post('/rounds', (req, res) => {
     return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
   }
 
-  const { playerName, roundsSurvived, bestWords } = req.body;
+  const { playerName, roundsSurvived, bestWords, totalTimeSeconds } = req.body;
 
   if (!validatePlayerName(playerName)) {
     return res.status(400).json({ error: 'Invalid player name. Must be 2-16 alphanumeric characters or underscores.' });
@@ -105,17 +53,21 @@ router.post('/rounds', (req, res) => {
     return res.status(400).json({ error: 'Invalid rounds survived. Must be 0-200.' });
   }
 
-  if (!validateWordsScore(bestWords)) {
+  if (typeof bestWords !== 'number' || bestWords < 0 || bestWords > 200) {
     return res.status(400).json({ error: 'Invalid best words. Must be 0-200.' });
+  }
+
+  if (!validateTime(totalTimeSeconds)) {
+    return res.status(400).json({ error: 'Invalid total time.' });
   }
 
   try {
     const stmt = db.prepare(`
-      INSERT INTO leaderboard_rounds (player_name, rounds_survived, best_words)
-      VALUES (?, ?, ?)
+      INSERT INTO leaderboard_rounds (player_name, rounds_survived, best_words, total_time_seconds)
+      VALUES (?, ?, ?, ?)
     `);
     
-    const result = stmt.run(playerName, roundsSurvived, bestWords);
+    const result = stmt.run(playerName, roundsSurvived, bestWords, totalTimeSeconds || 0);
     
     res.status(201).json({ 
       id: result.lastInsertRowid, 
@@ -127,64 +79,93 @@ router.post('/rounds', (req, res) => {
   }
 });
 
-// GET /api/leaderboard/words - Get top 50 words scores
-router.get('/words', (req, res) => {
+// GET /api/leaderboard/rounds - Get paginated leaderboard
+router.get('/rounds', (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = 10;
+  const offset = (page - 1) * limit;
+  
   try {
+    // Get total count
+    const countStmt = db.prepare('SELECT COUNT(*) as total FROM leaderboard_rounds');
+    const countResult = countStmt.get();
+    const total = countResult.total;
+    const totalPages = Math.min(5, Math.ceil(total / limit));
+    
+    // Get paginated results - sort by rounds DESC, then time ASC (lower time = better)
     const stmt = db.prepare(`
       SELECT 
         player_name as name,
-        words_score as wordsScore,
-        round_number as roundNumber,
-        banned_count as bannedCount,
-        round_seconds as roundSeconds,
+        rounds_survived as roundsSurvived,
+        best_words as bestWords,
+        total_time_seconds as totalTimeSeconds,
         created_at as date
-      FROM leaderboard_words
-      ORDER BY words_score DESC, banned_count DESC, created_at ASC
-      LIMIT 50
+      FROM leaderboard_rounds
+      ORDER BY rounds_survived DESC, total_time_seconds ASC, created_at ASC
+      LIMIT ? OFFSET ?
     `);
     
-    const scores = stmt.all();
+    const scores = stmt.all(limit, offset);
     
+    // Calculate rank for each entry
     const result = scores.map((row, index) => ({
-      rank: index + 1,
+      rank: offset + index + 1,
       ...row,
+      totalTime: formatTime(row.totalTimeSeconds),
       date: new Date(row.date).toISOString().split('T')[0]
     }));
     
-    res.json({ scores: result });
+    res.json({ 
+      scores: result, 
+      pagination: {
+        page,
+        totalPages,
+        total,
+        hasNext: page < totalPages,
+        hasPrev: page > 1
+      }
+    });
   } catch (err) {
     console.error('Database error:', err);
     res.status(500).json({ error: 'Failed to fetch leaderboard.' });
   }
 });
 
-// GET /api/leaderboard/rounds - Get top 50 rounds scores
-router.get('/rounds', (req, res) => {
+// GET /api/leaderboard/rank - Get rank for a specific score
+router.get('/rank', (req, res) => {
+  const { roundsSurvived, totalTimeSeconds } = req.query;
+  
+  if (roundsSurvived === undefined || totalTimeSeconds === undefined) {
+    return res.status(400).json({ error: 'Missing parameters.' });
+  }
+  
   try {
+    const rounds = parseInt(roundsSurvived);
+    const time = parseInt(totalTimeSeconds);
+    
+    // Count how many entries would rank higher
     const stmt = db.prepare(`
-      SELECT 
-        player_name as name,
-        rounds_survived as roundsSurvived,
-        best_words as bestWords,
-        created_at as date
+      SELECT COUNT(*) as count
       FROM leaderboard_rounds
-      ORDER BY rounds_survived DESC, best_words DESC, created_at ASC
-      LIMIT 50
+      WHERE rounds_survived > ? 
+         OR (rounds_survived = ? AND total_time_seconds < ?)
     `);
     
-    const scores = stmt.all();
+    const result = stmt.get(rounds, rounds, time);
+    const rank = result.count + 1;
+    const qualifies = rank <= 50;
     
-    const result = scores.map((row, index) => ({
-      rank: index + 1,
-      ...row,
-      date: new Date(row.date).toISOString().split('T')[0]
-    }));
-    
-    res.json({ scores: result });
+    res.json({ rank, qualifies });
   } catch (err) {
     console.error('Database error:', err);
-    res.status(500).json({ error: 'Failed to fetch leaderboard.' });
+    res.status(500).json({ error: 'Failed to calculate rank.' });
   }
 });
+
+function formatTime(seconds) {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
 
 module.exports = router;
