@@ -7,12 +7,12 @@ const submissionLimits = new Map();
 
 function checkRateLimit(ip) {
   const now = Date.now();
-  const hourAgo = now - 3600000;
+  const tenMinutesAgo = now - 600000;
 
   const submissions = submissionLimits.get(ip) || [];
-  const recentSubmissions = submissions.filter((time) => time > hourAgo);
+  const recentSubmissions = submissions.filter((time) => time > tenMinutesAgo);
 
-  if (recentSubmissions.length >= 10) {
+  if (recentSubmissions.length >= 100) {
     return false;
   }
 
