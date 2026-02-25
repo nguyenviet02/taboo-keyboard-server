@@ -67,22 +67,62 @@ router.post("/rounds", (req, res) => {
   }
 
   try {
-    const stmt = db.prepare(`
-      INSERT INTO leaderboard_rounds (player_name, rounds_survived, best_words, total_time_seconds)
-      VALUES (?, ?, ?, ?)
-    `);
-
-    const result = stmt.run(
-      playerName,
-      roundsSurvived,
-      bestWords,
-      totalTimeSeconds || 0,
+    // Check if player already exists
+    const existingStmt = db.prepare(
+      "SELECT * FROM leaderboard_rounds WHERE player_name = ?"
     );
+    const existing = existingStmt.get(playerName);
 
-    res.status(201).json({
-      id: result.lastInsertRowid,
-      success: true,
-    });
+    if (existing) {
+      // Check if new score is better: more rounds OR same rounds with less time
+      const isNewBetter =
+        roundsSurvived > existing.rounds_survived ||
+        (roundsSurvived === existing.rounds_survived &&
+          totalTimeSeconds < existing.total_time_seconds);
+
+      if (isNewBetter) {
+        // Update existing record
+        const updateStmt = db.prepare(`
+          UPDATE leaderboard_rounds 
+          SET rounds_survived = ?, best_words = ?, total_time_seconds = ?, created_at = CURRENT_TIMESTAMP
+          WHERE player_name = ?
+        `);
+        updateStmt.run(roundsSurvived, bestWords, totalTimeSeconds || 0, playerName);
+        
+        res.status(200).json({
+          id: existing.id,
+          success: true,
+          updated: true,
+        });
+      } else {
+        // New score is not better, don't update
+        res.status(200).json({
+          id: existing.id,
+          success: true,
+          updated: false,
+          message: "Existing score is better",
+        });
+      }
+    } else {
+      // Player doesn't exist, insert new record
+      const stmt = db.prepare(`
+        INSERT INTO leaderboard_rounds (player_name, rounds_survived, best_words, total_time_seconds)
+        VALUES (?, ?, ?, ?)
+      `);
+
+      const result = stmt.run(
+        playerName,
+        roundsSurvived,
+        bestWords,
+        totalTimeSeconds || 0,
+      );
+
+      res.status(201).json({
+        id: result.lastInsertRowid,
+        success: true,
+        updated: false,
+      });
+    }
   } catch (err) {
     console.error("Database error:", err);
     res.status(500).json({ error: "Failed to save score." });
@@ -145,7 +185,7 @@ router.get("/rounds", (req, res) => {
 
 // GET /api/leaderboard/rank - Get rank for a specific score
 router.get("/rank", (req, res) => {
-  const { roundsSurvived, totalTimeSeconds } = req.query;
+  const { roundsSurvived, totalTimeSeconds, playerName } = req.query;
 
   if (roundsSurvived === undefined || totalTimeSeconds === undefined) {
     return res.status(400).json({ error: "Missing parameters." });
@@ -156,14 +196,30 @@ router.get("/rank", (req, res) => {
     const time = parseInt(totalTimeSeconds);
 
     // Count how many entries would rank higher
-    const stmt = db.prepare(`
-      SELECT COUNT(*) as count
-      FROM leaderboard_rounds
-      WHERE rounds_survived > ? 
-         OR (rounds_survived = ? AND total_time_seconds < ?)
-    `);
+    // If playerName is provided, exclude their existing entry from the count
+    let stmt;
+    let result;
+    
+    if (playerName) {
+      stmt = db.prepare(`
+        SELECT COUNT(*) as count
+        FROM leaderboard_rounds
+        WHERE player_name != ? AND (
+          rounds_survived > ? 
+          OR (rounds_survived = ? AND total_time_seconds < ?)
+        )
+      `);
+      result = stmt.get(playerName, rounds, rounds, time);
+    } else {
+      stmt = db.prepare(`
+        SELECT COUNT(*) as count
+        FROM leaderboard_rounds
+        WHERE rounds_survived > ? 
+           OR (rounds_survived = ? AND total_time_seconds < ?)
+      `);
+      result = stmt.get(rounds, rounds, time);
+    }
 
-    const result = stmt.get(rounds, rounds, time);
     const rank = result.count + 1;
     const qualifies = rank <= 50;
 
